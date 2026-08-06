@@ -54,6 +54,8 @@ if ROS2_AVAILABLE:
         center when control isn't applied every tick.
         """
 
+        CRUISE_SPEED_KMH = 10.0   # Fixed target speed
+
         def __init__(self, vehicle, role_name='hero', constraints=None):
             super().__init__(f'{role_name}_heading_control_bridge')
             self.vehicle = vehicle
@@ -68,8 +70,6 @@ if ROS2_AVAILABLE:
                 self.constraints.get('max_steer_angle_deg', 20.0))
             self.max_speed_kmh = float(
                 self.constraints.get('max_speed_kmh', 15.0))
-            self.max_rev_kmh = float(
-                self.constraints.get('max_reverse_speed_kmh', 5.0))
 
             # CARLA's max physical steer is ~70 degrees
             self.steer_limit = min(self.max_steer_deg / 70.0, 1.0)
@@ -83,55 +83,74 @@ if ROS2_AVAILABLE:
             self.steer_pub = self.create_publisher(
                 Float32, f'/carla/{role_name}/current_steer_angle', 10)
 
+            # Publish speed (m/s) so the driver node can read it
+            self.speed_pub = self.create_publisher(
+                Float32, f'/carla/{role_name}/speedometer', 10)
+
         def _on_control(self, msg):
+            """Read only steering from the driver."""
             self._latest = msg
 
         def apply_control(self):
             """
-            Apply control every tick.  If no new command, still apply the
-            last known steer so wheels don't snap back.
+            Use throttle from driver if set, else enforce 10 km/h. Steering from driver.
             """
             ctrl = carla.VehicleControl()
 
+            # 1. Steering
             if self._latest is not None:
-                msg = self._latest
-
-                # Update steer — clamp to max angle
                 new_steer = float(
-                    np.clip(msg.steer, -self.steer_limit, self.steer_limit))
+                    np.clip(self._latest.steer, -self.steer_limit, self.steer_limit))
                 self._current_steer = new_steer
-
-                # Speed enforcement
-                vel = self.vehicle.get_velocity()
-                speed_kmh = 3.6 * math.sqrt(
-                    vel.x**2 + vel.y**2 + vel.z**2)
-
-                limit = self.max_rev_kmh if msg.reverse else self.max_speed_kmh
-                if speed_kmh > limit:
-                    ctrl.throttle = 0.0
-                    ctrl.brake = float(min(1.0, (speed_kmh - limit) / 5.0))
-                else:
-                    ctrl.throttle = float(msg.throttle)
-                    ctrl.brake = float(msg.brake)
-
-                ctrl.hand_brake = bool(msg.hand_brake)
-                ctrl.reverse = bool(msg.reverse)
-                ctrl.gear = int(msg.gear)
-                ctrl.manual_gear_shift = bool(msg.manual_gear_shift)
-            else:
-                # No command received yet — hold position
-                ctrl.throttle = 0.0
-                ctrl.brake = 0.0
-
-            # ALWAYS apply the persistent steer (prevents snap-back)
+            
             ctrl.steer = self._current_steer
+
+            # 2. Speed Control (Target 10 km/h)
+            vel = self.vehicle.get_velocity()
+            speed_kmh = 3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)
+
+            if self._latest is not None and self._latest.throttle > 0.0:
+                # Use throttle from driver
+                ctrl.throttle = self._latest.throttle
+                ctrl.brake = 0.0
+            else:
+                # Enforce 10 km/h
+                speed_error = self.CRUISE_SPEED_KMH - speed_kmh
+
+                if speed_error > 0:
+                    # Need to speed up
+                    ctrl.throttle = float(min(speed_error * 0.4, 1.0))
+                    ctrl.brake    = 0.0
+                else:
+                    # Need to slow down
+                    ctrl.throttle = 0.0
+                    ctrl.brake    = float(min(abs(speed_error) * 0.2, 1.0))
+
+            # Absolute speed clamp
+            if speed_kmh > self.max_speed_kmh:
+                ctrl.throttle = 0.0
+                ctrl.brake    = 1.0
+
+            # CRITICAL: Force automatic transmission and release handbrake 
+            # otherwise the CARLA simulator will hold the car rigidly in place
+            ctrl.gear = 1
+            ctrl.manual_gear_shift = False
+            ctrl.hand_brake = False
+            ctrl.reverse = False
+
+            if self._latest is not None:
+                ctrl.hand_brake = self._latest.hand_brake
+                ctrl.reverse    = self._latest.reverse
+                
             self.vehicle.apply_control(ctrl)
 
-            # Publish current steer angle in degrees
-            angle_deg = self._current_steer * 70.0  # convert back to degrees
-            steer_msg = Float32()
-            steer_msg.data = float(angle_deg)
+            # 3. Diagnostics publishing
+            angle_deg = self._current_steer * 70.0
+            steer_msg = Float32(data=float(angle_deg))
             self.steer_pub.publish(steer_msg)
+
+            speed_msg = Float32(data=float(speed_kmh / 3.6)) # Publish as m/s
+            self.speed_pub.publish(speed_msg)
 
 
 # =============================================================================
@@ -283,7 +302,7 @@ def main():
         settings.no_rendering_mode = world_cfg.get('no_rendering_mode', False)
         world.apply_settings(settings)
 
-        vehicle, sensors, role_name = spawn_actors(world, config, ros2=args.ros2)
+        vehicle, sensors, role_name = spawn_actors(world, config, ros2=ROS2_AVAILABLE)
 
         constraints = config.get('constraints', {})
         print(f'\n[CONSTRAINTS]')
@@ -291,7 +310,7 @@ def main():
             print(f'  {k}: {v}')
 
         # ROS2 control bridge
-        if ROS2_AVAILABLE and args.ros2:
+        if ROS2_AVAILABLE:
             try:
                 rclpy.init()
                 control_bridge = GameControlBridge(
