@@ -22,6 +22,10 @@ These variables define the unbreakable physical limits of the cart. They should 
 *   `STEER_CMD_SPEED = 15.0`: The steering actuation velocity published to CARLA (`msg.steer`). It simulates the physical turning motion (0.45 deg per 35ms pulse) perfectly smoothly.
 *   `MOTOR_RIGHT = 51`, `MOTOR_LEFT = 49`, `MOTOR_STOP = 50`: The raw ASCII code signals sent over the serial bus to the Arduino. Note the critical `MOTOR_STOP`: the real cart motor has infinite run-on and **does not stop by itself** until this `50` command is explicitly received.
 *   `IMU_EMA_ALPHA = 0.3`: The Exponential Moving Average (EMA) smoothing factor used strictly on the raw IMU data stream to produce the `smoothed_yaw_rate`.
+*   `ENCODER_PORT = '/dev/ttyUSB1'`, `ENCODER_BAUD = 115200`: Serial link of the ESP32 streaming the steering encoder count (one reading per line, e.g. `-1234` or `Encoder: -1234`). Set `ENCODER_PORT = SERIAL_PORT` if the counts arrive on the steering command link instead.
+*   `ENCODER_MAX_RIGHT = -2500`, `ENCODER_MAX_LEFT = 2500`: Encoder counts at full right/left lock. Counts map linearly onto `±MAX_STEER_DEG` (one 0.45° pulse ≈ 75 counts).
+*   `ENCODER_MARGIN = 150`: Pulses toward a lock are refused this many counts before it (~2 pulses), leaving room for the motor's run-on.
+*   `ENCODER_TIMEOUT_S = 0.5`: If no encoder reading arrives within this window the encoder is treated as lost and **all steering pulses are blocked** (HUD shows `ENC: NO`).
 
 ### How `controller.py` Enforces Them
 *   **The Discrete Pulse Modulator (`MotorSteering` class):** To fix the 30ms delay and infinite run-on, the controller restricts the navigator to simple `pulse_right()` and `pulse_left()` method calls. When called, the controller forces the motor to `51`/`49`. The moment 35.0ms elapses, the `tick()` function intercepts it and **forces a `50` STOP command**.

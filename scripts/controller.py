@@ -6,6 +6,8 @@ Exposes simple pulse_right/pulse_left/hold API for any navigator script.
 """
 
 import math
+import re
+import threading
 import time
 import numpy as np
 
@@ -32,13 +34,24 @@ MOTOR_RIGHT        = 51
 MOTOR_LEFT         = 49
 MOTOR_STOP         = 50
 
-MAX_SPEED_KMH      = 7.0      
-THROTTLE           = 0.4      
-TARGET_THROTTLE    = 75       
-WHEELBASE_M        = 1.8      
-IMU_EMA_ALPHA      = 0.3      
+MAX_SPEED_KMH      = 7.0
+THROTTLE           = 0.4
+TARGET_THROTTLE    = 75
+WHEELBASE_M        = 1.8
+IMU_EMA_ALPHA      = 0.3
 SERIAL_PORT        = '/dev/ttyUSB0'
 SERIAL_BAUD        = 9600
+
+# Steering encoder (ESP32). Set ENCODER_PORT = SERIAL_PORT if the counts come
+# back on the steering command link instead of a separate USB device.
+ENCODER_PORT       = '/dev/ttyUSB1'
+ENCODER_BAUD       = 115200
+ENCODER_MAX_RIGHT  = -2500    # Count at full right lock
+ENCODER_MAX_LEFT   = 2500     # Count at full left lock
+ENCODER_MARGIN     = 150      # Stop pulsing this far before lock (~2 pulses of motor run-on)
+ENCODER_TIMEOUT_S  = 0.5      # Older reading = encoder lost, steering pulses blocked
+ENCODER_CENTER     = (ENCODER_MAX_LEFT + ENCODER_MAX_RIGHT) / 2.0
+ENCODER_HALF_RANGE = (ENCODER_MAX_LEFT - ENCODER_MAX_RIGHT) / 2.0
 
 def build_serial_command(
     a_val=0, b_throttle=50, c_val=0, d_steering=50,
@@ -99,6 +112,48 @@ class MotorSteering:
         self.simulated_angle = max(-MAX_STEER_DEG, self.simulated_angle - DEG_PER_PULSE)
         return True
 
+class SteeringEncoder:
+    """Background reader for the steering encoder count streamed over serial.
+    Takes the first integer on each line, so '-1234' and 'Encoder: -1234' both work.
+    """
+    _NUM_RE = re.compile(r'(?<![\w.])[-+]?\d+(?![\w.])')
+
+    def __init__(self, ser, logger):
+        self.ser = ser
+        self.logger = logger
+        self.count = None
+        self._stamp = 0.0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        buf = b''
+        while not self._stop.is_set():
+            try:
+                buf += self.ser.readline()
+            except Exception as e:
+                if not self._stop.is_set():
+                    self.logger.error(f'Encoder serial read failed: {e}')
+                return
+            # readline() returns partial data on timeout; only parse complete lines
+            if not buf.endswith(b'\n'):
+                if len(buf) > 256: buf = b''
+                continue
+            match = self._NUM_RE.search(buf.decode('utf-8', errors='ignore'))
+            buf = b''
+            if match:
+                self.count = int(match.group())
+                self._stamp = time.time()
+
+    @property
+    def ok(self):
+        return self.count is not None and (time.time() - self._stamp) < ENCODER_TIMEOUT_S
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=0.5)
+
 def quat_to_yaw_deg(q):
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
@@ -124,10 +179,12 @@ class CartController:
 
         self.ser = None
         self.ctrl_pub = None
+        self.encoder = None
         self._last_serial_time = 0.0
 
         self._setup_imu()
         self._setup_control_output()
+        self._setup_encoder()
 
     def _setup_imu(self):
         qos = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT, durability=QoSDurabilityPolicy.VOLATILE)
@@ -141,6 +198,19 @@ class CartController:
                 self.ser = serial.Serial(port=SERIAL_PORT, baudrate=SERIAL_BAUD, timeout=0.05)
             except Exception as e:
                 self.node.get_logger().warn(f'Serial failed: {e}')
+
+    def _setup_encoder(self):
+        if self.mode != 'cart' or serial is None: return
+        if ENCODER_PORT == SERIAL_PORT:
+            if self.ser is None: return
+            enc_ser = self.ser
+        else:
+            try:
+                enc_ser = serial.Serial(port=ENCODER_PORT, baudrate=ENCODER_BAUD, timeout=0.1)
+            except Exception as e:
+                self.node.get_logger().warn(f'Encoder serial failed: {e} (steering pulses blocked)')
+                return
+        self.encoder = SteeringEncoder(enc_ser, self.node.get_logger())
 
     def _on_imu(self, msg):
         try:
@@ -165,7 +235,46 @@ class CartController:
         if speed_ms < 0.3: return 0.0
         return math.degrees(math.atan2(math.radians(self.smoothed_yaw_rate) * WHEELBASE_M, speed_ms))
 
+    @property
+    def encoder_count(self):
+        """Steering encoder count (+ = left), or None if stale. CARLA derives it from simulated_angle."""
+        if self.mode == 'carla':
+            return int(round(ENCODER_CENTER - self.motor.simulated_angle / MAX_STEER_DEG * ENCODER_HALF_RANGE))
+        if self.encoder is None or not self.encoder.ok: return None
+        return self.encoder.count
+
+    @property
+    def encoder_ok(self): return self.encoder_count is not None
+
+    @property
+    def encoder_steer_deg(self):
+        """Measured wheel angle, right positive (same sign as simulated_angle)."""
+        count = self.encoder_count
+        if count is None: return None
+        return -(count - ENCODER_CENTER) / ENCODER_HALF_RANGE * MAX_STEER_DEG
+
+    def can_pulse_right(self):
+        count = self.encoder_count
+        return count is not None and count > ENCODER_MAX_RIGHT + ENCODER_MARGIN
+
+    def can_pulse_left(self):
+        count = self.encoder_count
+        return count is not None and count < ENCODER_MAX_LEFT - ENCODER_MARGIN
+
+    def pulse_right(self):
+        if not self.can_pulse_right(): return False
+        return self.motor.pulse_right()
+
+    def pulse_left(self):
+        if not self.can_pulse_left(): return False
+        return self.motor.pulse_left()
+
     def tick(self):
+        if self.mode == 'cart':
+            if self.encoder_ok:
+                self.motor.simulated_angle = self.encoder_steer_deg
+            else:
+                self.node.get_logger().warn('Steering encoder not reporting, pulses blocked', throttle_duration_sec=2.0)
         self.motor.tick()
         self._send_hw()
 
@@ -194,11 +303,17 @@ class CartController:
                 serial_cmd = build_serial_command(b_throttle=TARGET_THROTTLE, d_steering=self.motor.motor, i_brake=0)
                 try:
                     self.ser.write(serial_cmd.encode())
-                    while self.ser.readline(): pass
+                    # When the encoder shares this port its reader thread drains the replies
+                    if self.encoder is None or self.encoder.ser is not self.ser:
+                        while self.ser.readline(): pass
                 except Exception as e:
                     pass
 
     def destroy(self):
+        if self.encoder:
+            self.encoder.stop()
+            if self.encoder.ser is not self.ser:
+                self.encoder.ser.close()
         if self.ser and self.ser.is_open:
             self.ser.write(build_serial_command(b_throttle=50, d_steering=50, i_brake=1).encode())
             time.sleep(0.05)

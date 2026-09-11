@@ -19,6 +19,18 @@ except ImportError:
 
 from controller import CartController, TOPICS
 
+def _fix_qt_font_dir():
+    # opencv-python points Qt at its bundled cv2/qt/fonts; if that folder is missing or empty
+    # Qt floods the terminal with "QFontDatabase: Cannot find font directory" warnings.
+    font_dir = os.environ.get('QT_QPA_FONTDIR')
+    if not font_dir or (os.path.isdir(font_dir) and os.listdir(font_dir)): return
+    for sys_dir in ('/usr/share/fonts/truetype/dejavu', '/usr/share/fonts/TTF'):
+        if os.path.isdir(sys_dir):
+            os.environ['QT_QPA_FONTDIR'] = sys_dir
+            return
+
+_fix_qt_font_dir()
+
 K_OFFSET           = 0.05
 LOOKAHEAD_ROWS     = 10
 EMA_ALPHA          = 0.15
@@ -137,8 +149,11 @@ class CartNavigator(Node):
                 self._pid_output = 0.0
                 self._integral_error *= 0.95
             else:
-                self._integral_error += self._composite_error * dt
-                self._integral_error = max(-20.0, min(20.0, self._integral_error))
+                # Anti-windup: don't integrate toward a steering lock the encoder guard is blocking
+                can_steer = self.ctrl.can_pulse_right() if self._composite_error > 0 else self.ctrl.can_pulse_left()
+                if can_steer:
+                    self._integral_error += self._composite_error * dt
+                    self._integral_error = max(-20.0, min(20.0, self._integral_error))
 
                 eff_yaw = self.ctrl.smoothed_yaw_rate if abs(self.ctrl.smoothed_yaw_rate) > 0.5 else 0.0
 
@@ -162,10 +177,11 @@ class CartNavigator(Node):
 
             if time_in_cycle < on_time:
                 if self.ctrl.motor.is_idle:
+                    # Encoder-guarded: refused near ±2500 lock or when the encoder is stale
                     if self._pid_output > 0:
-                        self.ctrl.motor.pulse_right()
+                        self.ctrl.pulse_right()
                     else:
-                        self.ctrl.motor.pulse_left()
+                        self.ctrl.pulse_left()
             else:
                 pass
 
@@ -216,8 +232,13 @@ class CartNavigator(Node):
                     (10, y), font, 0.50, (200, 200, 255), 1); y += 22
         cv2.putText(vis, f'IMU Steer: {self.ctrl.imu_steer_deg:+.1f} deg',
                     (10, y), font, 0.50, (200, 200, 255), 1); y += 22
-        cv2.putText(vis, f'Sim Steer: {self.ctrl.motor.simulated_angle:+.1f} deg',
-                    (10, y), font, 0.50, (200, 255, 200), 1); y += 22
+        enc = self.ctrl.encoder_count
+        if enc is None:
+            enc_str, enc_col = 'Enc Steer: ---', (100, 100, 100)
+        else:
+            lock = '' if self.ctrl.can_pulse_right() and self.ctrl.can_pulse_left() else '  LIMIT'
+            enc_str, enc_col = f'Enc Steer: {self.ctrl.encoder_steer_deg:+.1f} deg ({enc:+d}){lock}', (200, 255, 200)
+        cv2.putText(vis, enc_str, (10, y), font, 0.50, enc_col, 1); y += 22
         cv2.putText(vis, f'Yaw Rate: {self.ctrl.smoothed_yaw_rate:+.1f} d/s',
                     (10, y), font, 0.50, (0, 255, 0), 1); y += 22
 
@@ -247,6 +268,9 @@ class CartNavigator(Node):
         imu_str = 'IMU: OK' if self.ctrl.imu_ok else 'IMU: NO'
         imu_col = (0, 220, 0) if self.ctrl.imu_ok else (0, 0, 220)
         cv2.putText(vis, imu_str, (2 * w // 3 + 15, 32), font, 0.58, imu_col, 1, cv2.LINE_AA)
+        enc_str = 'ENC: OK' if self.ctrl.encoder_ok else 'ENC: NO'
+        enc_col = (0, 220, 0) if self.ctrl.encoder_ok else (0, 0, 220)
+        cv2.putText(vis, enc_str, (2 * w // 3 + 135, 32), font, 0.58, enc_col, 1, cv2.LINE_AA)
 
     def _draw_compass(self, vis, w):
         cx, cy = w - COMPASS_R - COMPASS_MARGIN - 5, HUD_H + COMPASS_R + COMPASS_MARGIN
