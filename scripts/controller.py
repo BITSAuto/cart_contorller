@@ -15,6 +15,7 @@ try:
     import serial
 except ImportError:
     serial = None
+    print('[cart_controller] WARNING: pyserial not installed — cart serial output will be DISABLED')
 
 try:
     from carla_msgs.msg import CarlaEgoVehicleControl
@@ -145,6 +146,7 @@ class SteeringEncoder:
             if match:
                 self.count = int(match.group())
                 self._stamp = time.time()
+                self.logger.info(f'[Encoder] count={self.count}', throttle_duration_sec=5.0)
 
     @property
     def ok(self):
@@ -186,6 +188,16 @@ class CartController:
         self._setup_control_output()
         self._setup_encoder()
 
+        # --- Debug: startup diagnostics ---
+        self.node.get_logger().info(
+            f'[Controller] ===== STARTUP SUMMARY =====\n'
+            f'  Mode:      {mode.upper()}\n'
+            f'  Serial:    {"OPEN on " + SERIAL_PORT if self.ser and self.ser.is_open else "NOT AVAILABLE"}\n'
+            f'  Encoder:   {"ACTIVE on " + ENCODER_PORT if self.encoder else "NOT AVAILABLE"}\n'
+            f'  CARLA pub: {"ACTIVE" if self.ctrl_pub else "N/A"}\n'
+            f'  pyserial:  {"installed" if serial else "NOT INSTALLED"}'
+        )
+
     def _setup_imu(self):
         qos = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT, durability=QoSDurabilityPolicy.VOLATILE)
         self.node.create_subscription(Imu, self.topics['imu'], self._on_imu, qos)
@@ -196,6 +208,7 @@ class CartController:
         elif self.mode == 'cart' and serial is not None:
             try:
                 self.ser = serial.Serial(port=SERIAL_PORT, baudrate=SERIAL_BAUD, timeout=0.05)
+                self.node.get_logger().info(f'[Controller] Serial port OPENED: {SERIAL_PORT} @ {SERIAL_BAUD} baud')
             except Exception as e:
                 self.node.get_logger().warn(f'Serial failed: {e}')
 
@@ -211,6 +224,7 @@ class CartController:
                 self.node.get_logger().warn(f'Encoder serial failed: {e} (steering pulses blocked)')
                 return
         self.encoder = SteeringEncoder(enc_ser, self.node.get_logger())
+        self.node.get_logger().info(f'[Controller] Encoder reader STARTED on {enc_ser.port} @ {enc_ser.baudrate} baud')
 
     def _on_imu(self, msg):
         try:
@@ -222,8 +236,9 @@ class CartController:
                 self._imu_ok = True
             else:
                 self.smoothed_yaw_rate = IMU_EMA_ALPHA * raw_yaw + (1 - IMU_EMA_ALPHA) * self.smoothed_yaw_rate
-        except Exception:
+        except Exception as e:
             self._imu_ok = False
+            self.node.get_logger().error(f'[IMU] Processing FAILED: {e}', throttle_duration_sec=5.0)
 
     @property
     def imu_ok(self): return self._imu_ok
@@ -262,11 +277,23 @@ class CartController:
         return count is not None and count < ENCODER_MAX_LEFT - ENCODER_MARGIN
 
     def pulse_right(self):
-        if not self.can_pulse_right(): return False
+        if not self.can_pulse_right():
+            self.node.get_logger().warn(
+                f'[Steer] pulse_right BLOCKED | encoder_count={self.encoder_count} '
+                f'encoder_present={"yes" if self.encoder else "NO"} '
+                f'encoder_ok={self.encoder_ok}',
+                throttle_duration_sec=2.0)
+            return False
         return self.motor.pulse_right()
 
     def pulse_left(self):
-        if not self.can_pulse_left(): return False
+        if not self.can_pulse_left():
+            self.node.get_logger().warn(
+                f'[Steer] pulse_left BLOCKED | encoder_count={self.encoder_count} '
+                f'encoder_present={"yes" if self.encoder else "NO"} '
+                f'encoder_ok={self.encoder_ok}',
+                throttle_duration_sec=2.0)
+            return False
         return self.motor.pulse_left()
 
     def tick(self):
@@ -277,6 +304,15 @@ class CartController:
                 self.node.get_logger().warn('Steering encoder not reporting, pulses blocked', throttle_duration_sec=2.0)
         self.motor.tick()
         self._send_hw()
+
+        # --- Debug: periodic state dump ---
+        self.node.get_logger().info(
+            f'[Tick] motor={self.motor.motor} phase={self.motor._phase} '
+            f'sim_angle={self.motor.simulated_angle:+.1f}\u00b0 | '
+            f'enc={self.encoder_count} enc_ok={self.encoder_ok} | '
+            f'imu={self._imu_ok} yaw={self.smoothed_yaw_rate:+.1f}\u00b0/s | '
+            f'serial={"open" if self.ser and self.ser.is_open else "CLOSED/NONE"}',
+            throttle_duration_sec=3.0)
 
     def hold(self):
         self.motor.hold()
@@ -301,13 +337,24 @@ class CartController:
             if (now - self._last_serial_time) >= 0.030:
                 self._last_serial_time = now
                 serial_cmd = build_serial_command(b_throttle=TARGET_THROTTLE, d_steering=self.motor.motor, i_brake=0)
+                self.node.get_logger().debug(
+                    f'[Serial TX] {serial_cmd}',
+                    throttle_duration_sec=5.0)
                 try:
                     self.ser.write(serial_cmd.encode())
                     # When the encoder shares this port its reader thread drains the replies
                     if self.encoder is None or self.encoder.ser is not self.ser:
                         while self.ser.readline(): pass
                 except Exception as e:
-                    pass
+                    self.node.get_logger().error(
+                        f'[Serial] Write FAILED: {e}', throttle_duration_sec=2.0)
+        elif self.mode == 'cart':
+            self.node.get_logger().warn(
+                f'[Serial] Cannot send to cart — serial port not available. '
+                f'ser={"exists" if self.ser else "None"}, '
+                f'is_open={self.ser.is_open if self.ser else "N/A"}, '
+                f'pyserial={"installed" if serial else "NOT INSTALLED"}',
+                throttle_duration_sec=5.0)
 
     def destroy(self):
         if self.encoder:

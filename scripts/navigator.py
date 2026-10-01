@@ -187,6 +187,14 @@ class CartNavigator(Node):
 
             self.ctrl.tick()
 
+            # --- Debug: periodic navigation state ---
+            self.get_logger().info(
+                f'[Nav] error={self._composite_error:+.1f}° pid={self._pid_output:+.2f} '
+                f'duty={duty_cycle:.2f} on_time={on_time:.3f}s | '
+                f'motor={self.ctrl.motor.motor} enc_ok={self.ctrl.encoder_ok} '
+                f'imu_ok={self.ctrl.imu_ok} heading={"%.1f" % self.ctrl.car_heading_deg if self.ctrl.car_heading_deg is not None else "N/A"}',
+                throttle_duration_sec=3.0)
+
             self._draw(img, mask, offset, road_cx, img_cx)
 
         except Exception as e:

@@ -12,6 +12,7 @@ install(PROGRAMS
   scripts/spawn_vehicle.py
   scripts/controller.py
   scripts/navigator.py
+  scripts/read_encoder.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
